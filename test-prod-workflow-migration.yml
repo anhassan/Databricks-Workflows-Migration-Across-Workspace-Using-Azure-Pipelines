@@ -1,0 +1,321 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+variables:
+ databricks.host.test: 'https://adb-8256961986085813.13.azuredatabricks.net'
+ databricks.host.prod: 'https://adb-4678356216448463.3.azuredatabricks.net'
+ databricks.test.repo : 'development'
+ databricks.prod.repo : 'production'
+ databricks.dev.clusters : 'project_quantum;'
+ databricks.prod.clusters : 'project_quantum_prod;'
+ databricks.dev.pools : 'dummy_workflow_pool;'
+ databricks.prod.pools : 'dummy_workflow_pool_prod;'
+
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- script: echo Starting Workflows Migration from Test to Prod!
+  displayName: 'Starting Message for Migration Pipeline'
+
+# Downloading a particular Python Version
+- task: UsePythonVersion@0
+  displayName: 'Use Latest Python Version-3.8'
+  inputs:
+    versionSpec: '3.8'
+    addToPath: true
+    architecture: 'x64'
+
+# Installing Databricks CLI for running its commands
+- task: Bash@3
+  displayName : 'Install Databricks CLI'
+  inputs:
+    targetType: 'inline'
+    script: 'pip install -U databricks-cli'
+
+# Configuring the Databricks CLI For Test Workspace
+- task: Bash@3
+  displayName: 'Configure Databricks CLI For Test Databricks'
+  inputs:
+    targetType: 'inline'
+    script: |
+      conf='cat << EOM
+      $(databricks.host.test)
+      $(databricks.token.test)
+      EOM'
+      echo "$conf" | databricks configure --token
+      databricks jobs configure --version=2.1
+
+# Getting and Persisting test workflow artifacts if workflow is ready for migration
+- task: Bash@3
+  displayName: 'Get JSONs and metadata for Migration ready Workflows'
+  inputs:
+    targetType: 'inline'
+    script: |
+
+      # Getting job ids of all the databricks workflows in test workspace
+      job_ids=( $(databricks jobs list | awk '{print $1}') )
+      
+      for job_id in "${job_ids[@]}":
+      do
+          job_id=$(echo "$job_id" | sed 's/ //g' | tr -d '":')
+          
+          # Initializing new array to hold cluster names and pool names for jobs
+          cluster_names=()
+          pool_names=()
+          
+          # Getting the job name from the job_id
+          job_meta=$(databricks jobs get --job-id ${job_id})
+          job_name=$(echo "$job_meta" | jq ".settings.name")
+          job_name=$(echo "$job_name" | sed 's/ //g' | tr -d '":')
+          
+          echo "WORKFLOW NAME : $job_name"
+          
+          # Getting migration status of every workflow
+          migration_status=$(databricks jobs get --job-id ${job_id} | jq ".settings.tags.PROD_MIGRATION")
+
+          if [ -z "$migration_status" ]
+          then
+              migration_status="FALSE"
+          else
+              migration_status=$(echo "$migration_status" | tr -d '"')
+              echo "MIGRATION STATUS : $migration_status"
+          fi
+      
+          if [[ "$migration_status" == "TRUE" ]]
+          then
+              
+              # Checking if all the notebooks in all the tasks are pointing to the correct folder in test
+              tasks_notebooks=$(databricks jobs get --job-id $job_id | jq ".settings.tasks | .[].notebook_task.notebook_path")
+              num_notebooks=$(echo "$tasks_notebooks" | wc -l)
+              num_notebooks_correct_path=$(echo "$tasks_notebooks" | grep -w $(databricks.test.repo) | wc -l)
+
+              if (( $num_notebooks == $num_notebooks_correct_path ));
+              then
+                # Add the job name to the list of the jobs to be migrated
+                job_names+=($job_name)
+
+                # Getting cluster ids for all purpose clusters
+                cluster_ids=( $(echo $job_meta | jq ".settings.tasks | .[].existing_cluster_id") )
+                
+                # Getting cluster names for all purpose clusters
+                for cid in "${cluster_ids[@]}"
+                do
+                    cid=$(echo "$cid" | sed 's/ //g' | tr -d '"')
+        
+                    if [  "$cid" != null ]
+                    then
+                        cluster_name=$(databricks clusters list | grep -w $cid | awk '{print $2}')
+                        cluster_names+=($cluster_name)
+                    else
+                        cluster_names+=("null")
+                    fi
+        
+                done
+        
+                # Getting pool ids for job clusters
+                pool_ids=( $(echo $job_meta | jq  ".settings.job_clusters | .[].new_cluster.instance_pool_id") )
+                
+                # Getting pool names for job clusters
+                for plid in "${pool_ids[@]}"
+                do
+                    plid=$(echo "$plid" | sed 's/ //g' | tr -d '"')
+                    
+                    if [ "$plid" != null ]
+                    then
+                        pool_name=$(databricks instance-pools list | grep -w $plid | awk '{print $2}')
+                        pool_names+=($pool_name)
+                    else
+                        pool_names+=("null")
+                    fi
+                
+                done
+                
+                # Persisting test workflow artifacts onto the bash agent
+                echo "${pool_names[@]}" > "pool_names_$job_name.txt"
+                echo "${cluster_names[@]}" > "cluster_names_$job_name.txt"
+                echo "$(echo "$job_meta" | jq ".settings")" > "job_def_$job_name.json"
+                
+                # Disabling the prod migration tag for the workflow
+                job_def_test=$(databricks jobs get --job-id $job_id | jq '(.settings.tags.PROD_MIGRATION) |= "FALSE"' | jq ".settings")
+                echo "$job_def_test" > job_def_test_$job_name.json
+                databricks jobs reset --job-id $job_id --json-file job_def_test_$job_name.json
+          
+            else
+                echo "Workflow: $job_name contains $(($num_notebooks - $num_notebooks_correct_path)) notebook paths which are not pointing to the correct directory"
+            fi
+          
+          else      
+              echo "Workflow: $job_name has PROD_MIGRATION tag disabled and therefore is not ready for migration"
+          fi
+
+      done
+
+      # Persisting job names for those jobs which are ready for migration
+      if ((${#job_names[@]} != 0 ));
+      then
+          echo "${job_names[@]}" > "job_names_migration.txt"
+      else
+          echo "No Workflows in the test databricks workspace are ready for migration"
+      fi
+
+# Configuring the Databricks CLI For Prod Workspace
+- task: Bash@3
+  displayName: 'Configure Databricks CLI For Prod Databricks'
+  inputs:
+    targetType: 'inline'
+    script: |
+      conf='cat << EOM
+      $(databricks.host.prod)
+      $(databricks.token.prod)
+      EOM'
+      echo "$conf" | databricks configure --token
+      databricks jobs configure --version=2.1
+
+# Creating workflows in production after mapping compute and notebook paths from test to prod
+- task: Bash@3
+  displayName: 'Migrate Workflows to Production'
+  inputs:
+    targetType: 'inline'
+    script: |
+      
+      IFS=';' read -r -a dev_clusters_arr <<< "$(databricks.dev.clusters)"
+      IFS=";" read -r -a prod_clusters_arr <<< "$(databricks.prod.clusters)"
+      
+      IFS=';' read -r -a dev_pools_arr <<< "$(databricks.dev.pools)"
+      IFS=';' read -r -a prod_pools_arr <<< "$(databricks.prod.pools)"
+      
+      jobs_migration_file=job_names_migration.txt
+      
+      # Checking whether job migration file exists or not
+      if [ -f $jobs_migration_file ];
+      then
+          jobs_migrate=( $(cat $jobs_migration_file) )
+ 
+          for job_name in "${jobs_migrate[@]}":
+          
+          do
+              
+              # Flag for incorrect compute options - 0 for all correct and > 0 for at least one incorrect
+              incorrect_compute=0
+
+              job_name=$(echo "$job_name" | sed 's/ //g' | tr -d '":')
+              
+              # Pointing all the notebook path to the correct folder location in the production workspace
+              sed -i -e "s/\/Repos\/$(databricks.test.repo)/\/Repos\/$(databricks.prod.repo)/g" "job_def_$job_name.json"
+          
+              # Getting the updated workflow json with respect to notebook paths
+              job_meta=$(cat "job_def_$job_name.json" | jq '.')
+              job_meta_updated=$job_meta
+
+              # Getting the cluster names and ids
+              clusters_file=cluster_names_$job_name.txt
+   
+              # Checking whether test clusters file exists or not
+              if [ -f $clusters_file ];
+              then
+                  cluster_names=( $(cat $clusters_file) )
+   
+                      # Replacing cluster ids with cluster names
+                      for i in "${!cluster_names[@]}";
+                      do
+                          cluster_name=${cluster_names[$i]}
+                          cluster_name_updated=$cluster_name
+                          
+                          if [ "$cluster_name" != "null" ]
+                          then
+                          
+                              for j in "${!dev_clusters_arr[@]}";
+                              do
+                                  dev_cluster=${dev_clusters_arr[$j]}
+              
+                                      if [ "$cluster_name" == "$dev_cluster" ]
+                                      then
+                                          cluster_name_updated=${prod_clusters_arr[$j]}
+                                      fi
+                              done
+                              
+                              prod_cluster_id=$(databricks clusters list | grep -w $cluster_name_updated | awk '{print $1}')
+                              
+                              if [ -z "$prod_cluster_id" ]
+                              then
+                                echo "No cluster with cluster name : $cluster_name_updated exists in PROD"
+                                incorrect_compute=$(($incorrect_compute + 1))
+                              else
+                                job_meta_updated=$(echo $job_meta_updated | jq --argjson i $i --arg val $prod_cluster_id '(.tasks | .[$i] | .existing_cluster_id) |= $val') 
+                              fi
+
+                          fi
+                    done
+
+              else
+                  echo "No cluster compute option exists for Workflow : $job_name"
+              fi        
+              
+              # Checking whether test clusters file exists or not
+              pools_file=pool_names_$job_name.txt
+  
+              if [ -f $pools_file ];
+              then
+                  pool_names=( $(cat $pools_file) )
+              
+                  # Replacing pool ids with pool names
+                  for i in "${!pool_names[@]}";
+                  do
+                      pool_name=${pool_names[$i]}
+                      pool_name_updated=$pool_name
+
+                      if [ "$pool_name" != "null" ]
+                      then
+                          for j in "${dev_pools_arr[@]}";
+                          do
+                              dev_pool=${dev_pools_arr[$j]}
+                                  if [ "$pool_name" == "$dev_pool" ]
+                                  then
+                                      pool_name_updated=${prod_pools_arr[$j]}
+                                  fi
+                          done
+
+                          prod_pool_id=$(databricks instance-pools list | grep -w $pool_name_updated | awk '{print $1}')
+              
+                          if [ -z "$prod_pool_id" ]
+                          then
+                              echo "No Pool with pool name : $pool_name_updated exists"
+                              incorrect_compute=$(($incorrect_compute + 1))
+                          else
+                              job_meta_updated=$(echo $job_meta_updated | jq --argjson i $i --arg val $prod_pool_id '(.job_clusters | .[$i] | .new_cluster.instance_pool_id) |= $val')
+                          fi
+            
+                      fi
+                  done
+              else
+                  echo "No pool compute exists for Workflow : $job_name"
+              fi    
+              
+              echo "$(echo "$job_meta_updated" | jq ".")" > job_def_prod_$job_name.json
+          
+              job_id=$(databricks jobs list | grep -w $job_name | awk '{print $1}')
+              
+              if (( $incorrect_compute == 0 ));
+              then
+                  if [ -z "$job_id" ]
+                  then
+                      echo "Creating Job for the first time with job name : $job_name in Prod"
+                      databricks jobs create --json-file job_def_prod_$job_name.json
+                  else
+                    echo "Updating Job with changes if there exist any for job name : $job_name in Prod"
+                    databricks jobs reset --job-id $job_id --json-file job_def_prod_$job_name.json
+                  fi
+              else
+                  echo "Atleast of the compute options used in the tasks of Workflow : $job_name either do not exist in Prod or no mapping is provided for them"
+              fi
+
+          done
+
+      else
+          echo "No workflows were ready for migrations from test workspace to prod workspace"  
+
+      fi

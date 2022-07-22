@@ -36,5 +36,5 @@ The architecture diagram below explain the entire process in more detail:
 
 
 <p align="center">
-  <img src="assets/Workflow_Migration_CI_Pipeline_Architecture.png" />
+  <img src="assets/Workflow_Migration_CI_Pipeline_Architecture.PNG" />
 </p>

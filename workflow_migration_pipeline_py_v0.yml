@@ -1,0 +1,531 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+variables:
+ databricks.host.test: 'https://adb-8256961986085813.13.azuredatabricks.net'
+ databricks.host.prod: 'https://adb-4678356216448463.3.azuredatabricks.net'
+
+
+pool:
+  vmImage: ubuntu-latest
+  
+
+steps:
+- script: echo Starting Workflows Migration from Test to Prod!
+  displayName: 'Starting Message for Migration Pipeline'
+
+
+# Downloading a particular Python Version
+- task: UsePythonVersion@0
+  displayName: 'Use Latest Python Version-3.8'
+  inputs:
+    versionSpec: '3.8'
+    addToPath: true
+    architecture: 'x64'
+
+
+# Installing Databricks CLI for running its commands
+- task: Bash@3
+  displayName : 'Python Script Install Databricks CLI'
+  inputs:
+    targetType: 'inline'
+    script: 'pip install -U databricks-cli requests'
+
+
+# Configuring the Databricks CLI For Test Workspace
+- task: Bash@3
+  displayName: 'Configure Databricks CLI For Test Databricks'
+  inputs:
+    targetType: 'inline'
+    script: |
+      conf='cat << EOM
+      $(databricks.host.test)
+      $(databricks.token.test)
+      EOM'
+      echo "$conf" | databricks configure --token
+      #databricks jobs configure --version
+      
+
+# Getting and Persisting test workflow artifacts if workflow is ready for migration
+- task: PythonScript@0
+  displayName: 'Get JSONs and metadata for Migration ready Workflows'
+  inputs:
+    scriptSource: 'inline'
+    script: |
+
+      import requests
+      import json
+      
+      
+      def is_migration_status_set(job_def):
+        migration_status = False
+        if "tags" in list(job_def["settings"].keys()):
+          if "PROD_MIGRATION" in list(job_def["settings"]["tags"].keys()):
+            if job_def["settings"]["tags"]["PROD_MIGRATION"] == "TRUE":
+              migration_status = True
+        return migration_status
+      
+      
+      def is_tasks_orientations_set(job_def):
+        counter = 0
+        job_tasks = job_def["settings"]["tasks"]
+        num_tasks = len(job_tasks)
+        for task in job_tasks:
+          if "notebook_task" in list(task.keys()):
+            if "notebook_path" in list(task["notebook_task"].keys()):
+              if task["notebook_task"]["notebook_path"].startswith("/Repos/development"):
+                counter +=1
+        if counter == num_tasks:
+          return True
+        else:
+          return False
+        
+      
+      def del_cluster_policy_keys(del_keys,job_def):
+        job_def_copy = job_def.copy() 
+        if "job_clusters" in list(job_def_copy["settings"].keys()):
+          for job_cluster in job_def_copy["settings"]["job_clusters"]:
+            if "new_cluster" in list(job_cluster.keys()):
+              job_cluster_confs = job_cluster["new_cluster"]
+              for del_key in del_keys:
+                job_cluster_confs.pop(del_key,None)
+        return job_def_copy
+      
+      
+      def get_cluster_names(job_def):
+        cluster_names = []
+        job_tasks = job_def["settings"]["tasks"]
+        for task in job_tasks:
+          if "existing_cluster_id" in list(task.keys()):
+            cluster_id = task["existing_cluster_id"]
+            get_cluster_url = "https://{}/api/2.0/clusters/get?cluster_id={}".format(databricks_instance_name,cluster_id)
+            cluster_def = json.loads(requests.get(get_cluster_url,headers=headers).content)
+            cluster_name = cluster_def["cluster_name"]
+            cluster_names.append(cluster_name)
+        return cluster_names
+      
+      
+      def get_pool_names(job_def):
+        pool_names = []
+        if "job_clusters" in list(job_def["settings"].keys()):
+          for job_cluster in job_def["settings"]["job_clusters"]:
+            if "new_cluster" in list(job_cluster.keys()): 
+              if "instance_pool_id" in list(job_cluster["new_cluster"].keys()):
+                pool_id = job_cluster["new_cluster"]["instance_pool_id"]
+                get_pool_url = "https://{}/api/2.0/instance-pools/get?instance_pool_id={}".format(databricks_instance_name,pool_id)
+                pool_def = json.loads(requests.get(get_pool_url,headers=headers).content)
+                pool_name = pool_def["instance_pool_name"]
+                pool_names.append(pool_name)
+        return pool_names
+      
+      
+      def get_cluster_policies_names(job_def):
+        cluster_policies_names = []
+        if "job_clusters" in list(job_def["settings"].keys()):
+          for job_cluster in job_def["settings"]["job_clusters"]:
+            if "new_cluster" in list(job_cluster.keys()):
+              if "policy_id" in list(job_cluster["new_cluster"].keys()):
+                cluster_policy_id = job_cluster["new_cluster"]["policy_id"]
+                get_cluster_policy_url = "https://{}/api/2.0/policies/clusters/get?policy_id={}".format(databricks_instance_name,cluster_policy_id)
+                cluster_policy_def = json.loads(requests.get(get_cluster_policy_url,headers=headers).content)
+                cluster_policy_name = cluster_policy_def["name"]
+                cluster_policies_names.append(cluster_policy_name)
+        return cluster_policies_names
+      
+      
+      def write_to_file(input_content,filename,ext="txt"):
+        with open("{}.{}".format(filename,ext),"w") as file_handler:
+          if ext == "txt":
+            for element in input_content:
+              file_handler.write("{}\n".format(str(element)))
+          if ext == "json":
+            json_obj = json.dumps(input_content)
+            file_handler.write(json_obj)
+      
+      
+      def read_from_file(filename,ext="txt"):
+        with open("{}.{}".format(filename,ext),"r") as file_handler:
+          if ext == "txt":
+            output = []
+            for line in file_handler:
+              content = line[:-1]
+              output.append(content)
+            return output
+          if ext == "json":
+            return json.load(file_handler)
+      
+      
+      def append_to_file(input_content,filename,ext="txt"):
+        with open("{}.{}".format(filename,ext),"a") as file_handler:
+          for element in input_content:
+            file_handler.write("{}\n".format(str(element)))
+      
+      print('$(databricks.host.test)')
+      databricks_instance_name = "{}".format('$(databricks.host.test)').replace("https://","")
+      headers={"Authorization": "Bearer {}".format('$(databricks.token.test)')}
+      
+      
+      list_jobs_url = "https://{}/api/2.0/jobs/list".format(databricks_instance_name)
+      jobs_list = json.loads(requests.get(list_jobs_url, headers=headers).content)['jobs']
+      job_ids = [job["job_id"] for job in jobs_list]
+      job_names = [job["settings"]["name"] for job in jobs_list]
+      
+      for index,job_id in enumerate(job_ids):
+        
+        job_def_url = "https://{}/api/2.1/jobs/get?job_id={}".format(databricks_instance_name,job_id)
+        job_def = json.loads(requests.get(job_def_url,headers=headers).content)
+        
+        if is_migration_status_set(job_def):
+          job_name = job_names[index]
+          
+          if is_tasks_orientations_set(job_def):
+            
+            print("Migrating Workflow : {} to Production Environment".format(job_name))
+            
+            job_def_updated = del_cluster_policy_keys(["spark_conf","spark_env_vars","init_scripts"],job_def)
+            
+            cluster_names = get_cluster_names(job_def_updated)
+            write_to_file(cluster_names,"{}_cluster_names".format(job_name))
+            
+            pool_names = get_pool_names(job_def_updated)
+            write_to_file(pool_names,"{}_pool_names".format(job_name))
+            
+            cluster_policies_names = get_cluster_policies_names(job_def_updated)
+            write_to_file(cluster_policies_names,"{}_cluster_policies_names".format(job_name))
+            
+            write_to_file(job_def_updated,"job_def_{}".format(job_name),"json")
+            
+            append_to_file([job_name],"job_names_migration")
+            
+          else:
+            print("Workflow Migration Failed for Workflow : {} because all the notebook paths are not pointing to /Repos/development".format(job_name))
+            append_to_file([job_name],"failed_job_names")
+
+
+
+# Configuring the Databricks CLI For Prod Workspace
+- task: Bash@3
+  displayName: 'Configure Databricks CLI For Prod Databricks'
+  inputs:
+    targetType: 'inline'
+    script: |
+      conf='cat << EOM
+      $(databricks.host.prod)
+      $(databricks.token.prod)
+      EOM'
+      echo "$conf" | databricks configure --token
+
+      
+
+# Creating workflows in production after mapping compute and notebook paths from test to prod
+- task: PythonScript@0
+  displayName: 'Migrate Workflows to Production'
+  inputs:
+    scriptSource: 'inline'
+    script: |
+      import requests
+      import json
+      
+      def switch_notebook_paths(job_def):
+        job_def_copy = job_def.copy()
+        job_tasks = job_def_copy["settings"]["tasks"]
+        for task in job_tasks:
+          if "notebook_task" in list(task.keys()):
+            if "notebook_path" in list(task["notebook_task"].keys()):
+              prev_notebook_path = task["notebook_task"]["notebook_path"]
+              new_notebook_path = prev_notebook_path.replace("/Repos/development","/Repos/production")
+              task["notebook_task"]["notebook_path"] = new_notebook_path
+        return job_def_copy
+      
+      
+      def replace_cluster_ids(cluster_ids,job_def):
+        job_def_copy = job_def.copy()
+        if len(cluster_ids) > 0:
+          counter = 0
+          job_tasks = job_def_copy["settings"]["tasks"]
+          for task in job_tasks:
+            if "existing_cluster_id" in list(task.keys()):
+              task["existing_cluster_id"] = cluster_ids[counter]
+              counter+=1
+        return job_def_copy
+      
+      
+      def get_cluster_ids(cluster_names):
+        
+        cluster_ids = []
+        cluster_names_found = []
+        list_clusters_url = "https://{}/api/2.0/clusters/list".format(databricks_instance_name)
+        clusters_list = json.loads(requests.get(list_clusters_url,headers=headers).content)["clusters"]
+        
+        for cluster_name in cluster_names:
+          for cluster in clusters_list:
+            if cluster["cluster_name"] == cluster_name:
+              cluster_ids.append(cluster["cluster_id"])
+              cluster_names_found.append(cluster_names)
+              
+        if len(cluster_names) != len(cluster_names_found):
+          clusters_diff = list(set(cluster_names) - set(cluster_names_found))
+          raise Exception("Cluster Names : {} Not Found in Production".format(clusters_diff))
+          
+        return cluster_ids
+        
+      
+      
+      def replace_pool_ids(pool_ids,job_def):
+        job_def_copy = job_def.copy()
+        if len(pool_ids) > 0:
+          counter = 0
+          if "job_clusters" in list(job_def_copy["settings"].keys()):
+            for job_cluster in job_def_copy["settings"]["job_clusters"]:
+              if "new_cluster" in list(job_cluster.keys()):
+                if "driver_instance_pool_id" in list(job_cluster["new_cluster"].keys()):
+                  job_cluster["new_cluster"]["driver_instance_pool_id"] = pool_ids[counter]
+                if "instance_pool_id" in list(job_cluster["new_cluster"].keys()):
+                  job_cluster["new_cluster"]["instance_pool_id"] = pool_ids[counter]
+                  counter +=1
+        return job_def_copy
+      
+      
+      
+      def get_pool_ids(pool_names):
+        
+        pool_ids = []
+        pool_names_found = []
+        list_pools_url = "https://{}/api/2.0/instance-pools/list".format(databricks_instance_name)
+        pools_list = json.loads(requests.get(list_pools_url,headers=headers).content)["instance_pools"]
+        
+        for pool_name in pool_names:
+          for pool in pools_list:
+            if pool_name == pool["instance_pool_name"]:
+              pool_ids.append(pool["instance_pool_id"])
+              pool_names_found.append(pool_name)
+          
+        if len(pool_names) != len(pool_names_found):
+          pools_diff = list(set(pool_names) - set(pool_names_found))
+          raise Exception("Pool Names : {} Not Found in Production".format(pools_diff))
+            
+        return pool_ids
+      
+      
+      def replace_cluster_policies_ids(cluster_policies_ids,job_def):
+        job_def_copy = job_def.copy()
+        if len(cluster_policies_ids) > 0:
+          counter = 0
+          if "job_clusters" in list(job_def_copy["settings"].keys()):
+            for job_cluster in job_def_copy["settings"]["job_clusters"]:
+              if "new_cluster" in list(job_cluster.keys()):
+                if "policy_id" in list(job_cluster["new_cluster"].keys()):
+                  job_cluster["new_cluster"]["policy_id"] = cluster_policies_ids[counter]
+                  counter += 1
+        return job_def_copy
+      
+      
+      def get_cluster_policies_ids(cluster_policies_names):
+        cluster_policies_ids = []
+        cluster_policies_names_found = []
+        list_cluster_policies_url = "https://{}/api/2.0/policies/clusters/list".format(databricks_instance_name)
+        cluster_policies_list = json.loads(requests.get(list_cluster_policies_url,headers=headers).content)["policies"]
+        
+        for cluster_policy_name in cluster_policies_names:
+          for cluster_policy in cluster_policies_list:
+            if cluster_policy_name == cluster_policy["name"]:
+              cluster_policies_ids.append(cluster_policy["policy_id"])
+              cluster_policies_names_found.append(cluster_policy_name)
+        
+        if len(cluster_policies_names) != len(cluster_policies_names_found):
+          cluster_policies_diff = list(set(cluster_policies_names) - set(cluster_policies_names_found))
+          raise Exception("Cluster Policies Names : {} Not Found in Production".format(clusters_policies_diff))
+        
+        return cluster_policies_ids
+      
+      
+      def create_update_job(job_name,job_def):
+        list_jobs_url = "https://{}/api/2.0/jobs/list".format(databricks_instance_name)
+        jobs_list = json.loads(requests.get(list_jobs_url, headers=headers).content)['jobs']
+        job_ids = [job["job_id"] for job in jobs_list]
+        job_names = [job["settings"]["name"] for job in jobs_list]
+        job_def_configs = job_def["settings"]
+        
+        if job_name not in job_names:
+          print("Creating Worklfow : {} as it did not exist before".format(job_name))
+          job_create_url = "https://{}/api/2.0/jobs/create".format(databricks_instance_name)
+          response = requests.post(job_create_url,headers=headers,json=job_def_configs)
+          print(response)
+
+          if int(response.status_code) != 200:
+             raise Exception("Creating Worklfow : {} with Response Code : {} and Response Detail : {}".format(job_name,response.status_code,json.loads(response.content)))
+          else:
+             print("Response Detail : {}".format(json.loads(response.content)))
+        
+        else:
+          print("Reseting/Updating Worklfow : {} ".format(job_name))
+          job_id = job_ids[job_names.index(job_name)]
+          payload = {"job_id" : job_id,
+                    "new_settings" : job_def_configs}
+          job_update_url = "https://{}/api/2.0/jobs/reset".format(databricks_instance_name)
+          response = requests.post(job_update_url,headers=headers,json=payload)
+          print(response)
+
+          if int(response.status_code) != 200:
+             raise Exception("Reseting/Updating Worklfow : {} with Response Code : {} and Response Detail : {}".format(job_name,response.status_code,json.loads(response.content)))
+          else:
+             print("Response Detail : {}".format(json.loads(response.content)))
+      
+      
+      def write_to_file(input_content,filename,ext="txt"):
+        with open("{}.{}".format(filename,ext),"w") as file_handler:
+          if ext == "txt":
+            for element in input_content:
+              file_handler.write("{}\n".format(str(element)))
+          if ext == "json":
+            json_obj = json.dumps(input_content)
+            file_handler.write(json_obj)
+      
+      
+      def read_from_file(filename,ext="txt"):
+        with open("{}.{}".format(filename,ext),"r") as file_handler:
+          if ext == "txt":
+            output = []
+            for line in file_handler:
+              content = line[:-1]
+              output.append(content)
+            return output
+          if ext == "json":
+            return json.load(file_handler)
+      
+      
+      def append_to_file(input_content,filename,ext="txt"):
+        with open("{}.{}".format(filename,ext),"a") as file_handler:
+          for element in input_content:
+            file_handler.write("{}\n".format(str(element)))
+      
+      
+      databricks_instance_name = "{}".format('$(databricks.host.prod)').replace("https://","")
+      headers={"Authorization": "Bearer {}".format('$(databricks.token.prod)')}
+      
+      try:
+          job_names = read_from_file("job_names_migration")
+      except Exception as error:
+          print("Error : {}".format(error))
+          job_names = []
+          
+      for job_name in job_names:
+        
+        
+        job_def = read_from_file("job_def_{}".format(job_name),"json")
+        
+        cluster_names = read_from_file("{}_cluster_names".format(job_name))
+        pool_names = read_from_file("{}_pool_names".format(job_name))
+        cluster_policies_names = read_from_file("{}_cluster_policies_names".format(job_name))
+        
+        try:
+            cluster_ids = get_cluster_ids(cluster_names)
+            pool_ids = get_pool_ids(pool_names)
+            cluster_policies_ids = get_cluster_policies_ids(cluster_policies_names)
+        except Exception as error:
+            print("Workflow : {} migration failed due to Error: {}".format(job_name,error))
+            append_to_file([job_name],"failed_job_names")
+       
+      
+        try:
+            job_def_updated = switch_notebook_paths(job_def)
+            job_def_updated = replace_cluster_ids(cluster_ids,job_def_updated)
+            job_def_updated = replace_pool_ids(pool_ids,job_def_updated)
+            job_def_updated = replace_cluster_policies_ids(cluster_policies_ids,job_def_updated)
+            
+            create_update_job(job_name,job_def_updated)
+            print("Workflow : {} got migrated successfully".format(job_name))
+            
+        except Exception as error:
+            print("Workflow : {} migration failed due to Error: {}".format(job_name,error))
+            try:
+                failed_jobs = read_from_file("failed_job_names")
+            except:
+                failed_jobs = []
+            if job_name not in  failed_jobs:
+              append_to_file([job_name],"failed_job_names")
+
+
+# Configuring the Databricks CLI For Test Workspace
+- task: Bash@3
+  displayName: 'Configure Databricks CLI For Test Databricks'
+  inputs:
+    targetType: 'inline'
+    script: |
+      conf='cat << EOM
+      $(databricks.host.test)
+      $(databricks.token.test)
+      EOM'
+      echo "$conf" | databricks configure --token
+
+
+# Updating the status of the workflows in the test after migration activity
+- task: PythonScript@0
+  displayName: 'Upgrade Prod Migration Tag Transaction'
+  inputs:
+    scriptSource: 'inline'
+    script: |
+
+      import requests
+      import json
+      
+      def update_job_status(job_names_list,update_type):
+        list_jobs_url = "https://{}/api/2.0/jobs/list".format(databricks_instance_name)
+        jobs_list = json.loads(requests.get(list_jobs_url, headers=headers).content)['jobs']
+        jobs_meta = [[job["job_id"],job["settings"]["name"]] for job in jobs_list if job["settings"]["name"] in job_names_list]
+        job_ids = [job_meta[0] for job_meta in jobs_meta]
+        job_names = [job_meta[1] for job_meta in jobs_meta]
+        
+        for index,job_id in enumerate(job_ids):
+            job_def_url = "https://{}/api/2.1/jobs/get?job_id={}".format(databricks_instance_name,job_id)
+            job_def = json.loads(requests.get(job_def_url,headers=headers).content)
+            job_def_copy = job_def.copy()
+      
+            if "tags" in list(job_def_copy["settings"].keys()):
+              if "PROD_MIGRATION" in list(job_def_copy["settings"]["tags"].keys()):
+                job_def_copy["settings"]["tags"]["PROD_MIGRATION"] = update_type
+                
+            print("Marking Migration for Worklfow : {} as {} ".format(job_names[index],update_type))
+            payload = {"job_id" : job_id,
+                      "new_settings" : job_def_copy["settings"]}
+            job_update_url = "https://{}/api/2.0/jobs/reset".format(databricks_instance_name)
+            response = requests.post(job_update_url,headers=headers,json=payload)
+            print(response)
+
+      
+      def read_from_file(filename,ext="txt"):
+        with open("{}.{}".format(filename,ext),"r") as file_handler:
+          if ext == "txt":
+            output = []
+            for line in file_handler:
+              content = line[:-1]
+              output.append(content)
+            return output
+          if ext == "json":
+            return json.load(file_handler)
+
+      
+      databricks_instance_name = "{}".format('$(databricks.host.test)').replace("https://","")
+      headers={"Authorization": "Bearer {}".format('$(databricks.token.test)')}
+      
+      try:
+          failed_jobs = read_from_file("failed_job_names")
+      except Exception as error:
+          print("No jobs failed migration....")
+          print("Detailed Error : {}".format(error))
+          failed_jobs = []
+
+      try:
+          ready_for_migration_jobs = read_from_file("job_names_migration")
+      except Exception as error:
+          print("No jobs ready for migration....")
+          print("Detailed Error : {}".format(error))
+          ready_for_migration_jobs = []
+
+      successful_jobs = [job for job in ready_for_migration_jobs if job not in failed_jobs]
+
+      update_job_status(successful_jobs,"FALSE")
+      update_job_status(failed_jobs,"FAILED")
+

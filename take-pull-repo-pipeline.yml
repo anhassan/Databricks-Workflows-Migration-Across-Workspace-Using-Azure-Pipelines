@@ -1,0 +1,164 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+  branches:
+    include:
+    - develop
+    - test
+    - main
+
+
+variables:
+- group: pipeline-variables
+
+
+pool: mercy-lxagentpool
+  
+stages:
+- stage: RunOnDev
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+  displayName: Update the Repo for Dev Databricks
+  jobs:
+  - job: RunOnDev
+    displayName: Run On Dev
+    steps:
+    - script: echo Starting Script to update the Databricks Repo
+      displayName: 'Start Pipeline to Update the Databricks Repo'
+
+    # Downloading a particular Python Version
+    - task: UsePythonVersion@0
+      displayName: 'Use Latest Python Version-3.8'
+      inputs:
+        versionSpec: '3.8'
+        addToPath: true
+        architecture: 'x64'
+
+    # Installing Databricks CLI for running its commands
+    - task: Bash@3
+      displayName : 'Python Script Install Databricks CLI'
+      inputs:
+        targetType: 'inline'
+        script: 'pip install -U databricks-cli requests'
+
+
+    # Configuring the Databricks CLI For Dev Workspace
+    - task: Bash@3
+      displayName: 'Configure Databricks CLI For Dev Databricks'
+      inputs:
+        targetType: 'inline'
+        script: |
+          conf='cat << EOM
+          $(databricks.host.dev)
+          $(databricks.token.dev)
+          EOM'
+          echo "$conf" | databricks configure --token
+
+
+    - task: Bash@3
+      displayName: 'Print Repo Name'
+      inputs:
+        targetType: 'inline'
+        script: 'echo "$(Build.Repository.Name)"'
+
+    # Update the Databricks Repo
+    - task: Bash@3
+      displayName: 'Update the Databricks Repo'
+      inputs:
+        targetType: 'inline'
+        script: |
+          databricks repos update --path /Repos/development/$(Build.Repository.Name) --branch develop
+
+- stage: RunOnTest
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/test')
+  displayName: Update the Repo for Test Databricks
+  jobs:
+  - job: RunOnTest
+    displayName: Run On Test
+    steps:
+    - script: echo Starting Script to update the Databricks Repo
+      displayName: 'Start Pipeline to Update the Databricks Repo'
+
+    # Downloading a particular Python Version
+    - task: UsePythonVersion@0
+      displayName: 'Use Latest Python Version-3.8'
+      inputs:
+        versionSpec: '3.8'
+        addToPath: true
+        architecture: 'x64'
+
+    # Installing Databricks CLI for running its commands
+    - task: Bash@3
+      displayName : 'Python Script Install Databricks CLI'
+      inputs:
+        targetType: 'inline'
+        script: 'pip install -U databricks-cli requests'
+
+
+    # Configuring the Databricks CLI For Test Workspace
+    - task: Bash@3
+      displayName: 'Configure Databricks CLI For Test Databricks'
+      inputs:
+        targetType: 'inline'
+        script: |
+          conf='cat << EOM
+          $(databricks.host.test)
+          $(databricks.token.test)
+          EOM'
+          echo "$conf" | databricks configure --token
+          
+    # Update the Databricks Repo
+    - task: Bash@3
+      displayName: 'Update the Databricks Repo'
+      inputs:
+        targetType: 'inline'
+        script: |
+          databricks repos update --path /Repos/development/$(Build.Repository.Name) --branch test
+
+- stage: RunOnProd
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+  displayName: Update the Repo for Prod Databricks
+  jobs:
+  - job: RunOnProd
+    displayName: Run On Prod
+    steps:
+    - script: echo Starting Script to update the Databricks Repo
+      displayName: 'Start Pipeline to Update the Databricks Repo'
+
+    # Downloading a particular Python Version
+    - task: UsePythonVersion@0
+      displayName: 'Use Latest Python Version-3.8'
+      inputs:
+        versionSpec: '3.8'
+        addToPath: true
+        architecture: 'x64'
+
+    # Installing Databricks CLI for running its commands
+    - task: Bash@3
+      displayName : 'Python Script Install Databricks CLI'
+      inputs:
+        targetType: 'inline'
+        script: 'pip install -U databricks-cli requests'
+
+
+    # Configuring the Databricks CLI For Prod Workspace
+    - task: Bash@3
+      displayName: 'Configure Databricks CLI For Prod Databricks'
+      inputs:
+        targetType: 'inline'
+        script: |
+          conf='cat << EOM
+          $(databricks.host.prod)
+          $(databricks.token.prod)
+          EOM'
+          echo "$conf" | databricks configure --token
+          
+    # Update the Databricks Repo
+    - task: Bash@3
+      displayName: 'Update the Databricks Repo'
+      inputs:
+        targetType: 'inline'
+        script: |
+          databricks repos update --path /Repos/development/$(Build.Repository.Name) --branch main

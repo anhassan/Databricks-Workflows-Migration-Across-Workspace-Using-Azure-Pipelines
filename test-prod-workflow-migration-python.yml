@@ -12,7 +12,7 @@ variables:
 
 
 
-pool: mercy-lxagentpool
+pool: lxagentpool
   
   
 
